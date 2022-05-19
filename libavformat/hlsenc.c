@@ -725,7 +725,7 @@ static int do_encrypt(AVFormatContext *s, VariantStream *vs)
 
     av_strlcpy(hls->key_basename, key_basename_source, len);
     av_strlcat(hls->key_basename, ".key", len);
-
+    // 如果有key_url将替换basename
     if (hls->key_url) {
         av_strlcpy(hls->key_file, hls->key_url, sizeof(hls->key_file));
         av_strlcpy(hls->key_uri, hls->key_url, sizeof(hls->key_uri));
@@ -782,7 +782,10 @@ static int do_encrypt(AVFormatContext *s, VariantStream *vs)
     return 0;
 }
 
-
+/*
+ *  1. 解析key info file,获取key uri,key file
+ *  2. 读取key file,获取key
+ */
 static int hls_encryption_start(AVFormatContext *s,  VariantStream *vs)
 {
     HLSContext *hls = s->priv_data;
@@ -1761,6 +1764,7 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
     }
 
     if (c->key_info_file || c->encrypt) {
+        // 不支持加密fmp4
         if (c->segment_type == SEGMENT_TYPE_FMP4) {
             av_log(s, AV_LOG_ERROR, "Encrypted fmp4 not yet supported\n");
             return AVERROR_PATCHWELCOME;
@@ -1772,6 +1776,7 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
         }
 
         if (!vs->encrypt_started || (c->flags & HLS_PERIODIC_REKEY)) {
+			// 使用keyinfo file和使用enc flag
             if (c->key_info_file) {
                 if ((err = hls_encryption_start(s, vs)) < 0)
                     goto fail;

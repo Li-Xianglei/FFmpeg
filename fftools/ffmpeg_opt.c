@@ -1424,6 +1424,8 @@ static int get_preset_file_2(const char *preset_name, const char *codec_name, AV
     return ret;
 }
 
+// remark 选择命令行输入的编码器名称
+// 使用-c 指定编解码器类型 -c:v video -c:a audio -c:v/a copy 拷贝原数据 -c:v libvpx-vp9 使用vp9 编码
 static int choose_encoder(OptionsContext *o, AVFormatContext *s, OutputStream *ost)
 {
     enum AVMediaType type = ost->st->codecpar->codec_type;
@@ -1462,8 +1464,8 @@ static int choose_encoder(OptionsContext *o, AVFormatContext *s, OutputStream *o
 static OutputStream *new_output_stream(OptionsContext *o, AVFormatContext *oc, enum AVMediaType type, int source_index)
 {
     OutputStream *ost;
-    AVStream *st = avformat_new_stream(oc, NULL);
-    int idx      = oc->nb_streams - 1, ret = 0;
+    AVStream *st = avformat_new_stream(oc, NULL); // 创建AVStream 创建空间,将AVStream与AVFormatContext建立联系,初始化AVStream成员
+    int idx = oc->nb_streams - 1, ret = 0;
     const char *bsfs = NULL, *time_base = NULL;
     char *next, *codec_tag = NULL;
     double qscale = -1;
@@ -1495,7 +1497,7 @@ static OutputStream *new_output_stream(OptionsContext *o, AVFormatContext *oc, e
         exit_program(1);
     }
 
-    ost->enc_ctx = avcodec_alloc_context3(ost->enc);
+    ost->enc_ctx = avcodec_alloc_context3(ost->enc);  // 编码上下文参数
     if (!ost->enc_ctx) {
         av_log(NULL, AV_LOG_ERROR, "Error allocating the encoding context.\n");
         exit_program(1);

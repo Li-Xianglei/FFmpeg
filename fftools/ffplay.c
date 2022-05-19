@@ -467,6 +467,7 @@ static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
     return ret;
 }
 
+// 给一些空包的含义？
 static int packet_queue_put_nullpacket(PacketQueue *q, AVPacket *pkt, int stream_index)
 {
     pkt->stream_index = stream_index;
@@ -610,6 +611,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                         ret = avcodec_receive_frame(d->avctx, frame);
                         if (ret >= 0) {
                             AVRational tb = (AVRational){1, frame->sample_rate};
+                            // 利用自己携带的或者是记录的next_pts
                             if (frame->pts != AV_NOPTS_VALUE)
                                 frame->pts = av_rescale_q(frame->pts, d->avctx->pkt_timebase, tb);
                             else if (d->next_pts != AV_NOPTS_VALUE)
@@ -631,6 +633,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
             } while (ret != AVERROR(EAGAIN));
         }
 
+        // 如果packet的序列和decode序列不同，跳过不同的
         do {
             if (d->queue->nb_packets == 0)
                 SDL_CondSignal(d->empty_queue_cond);
@@ -659,6 +662,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                 ret = AVERROR(EAGAIN);
             } else {
                 if (got_frame && !d->pkt->data) {
+                        // 获取到frame但为空
                     d->packet_pending = 1;
                 }
                 ret = got_frame ? 0 : (d->pkt->data ? AVERROR(EAGAIN) : AVERROR_EOF);
@@ -667,6 +671,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
         } else {
             if (avcodec_send_packet(d->avctx, d->pkt) == AVERROR(EAGAIN)) {
                 av_log(d->avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
+                    // 获取到frame但为空
                 d->packet_pending = 1;
             } else {
                 av_packet_unref(d->pkt);
@@ -1521,6 +1526,9 @@ static void step_to_next_frame(VideoState *is)
     is->step = 1;
 }
 
+// 根据视频时钟与同步时钟(如音频时钟)的差值，校正delay值，使视频时钟追赶或等待同步时钟
+// 输入参数delay是上一帧播放时长，即上一帧播放后应延时多长时间后再播放当前帧，通过调节此值来调节当前帧播放快慢
+// 返回值delay是将输入参数delay经校正后得到的值
 static double compute_target_delay(double delay, VideoState *is)
 {
     double sync_threshold, diff = 0;
@@ -1529,19 +1537,29 @@ static double compute_target_delay(double delay, VideoState *is)
     if (get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER) {
         /* if video is slave, we try to correct big delays by
            duplicating or deleting a frame */
+        // 视频和主时钟的差值
+        // 不包含上一帧视频的duration,就是说is->vidclk中不包含delay的值.
         diff = get_clock(&is->vidclk) - get_master_clock(is);
 
         /* skip or repeat frame. We take into account the
            delay to compute the threshold. I still don't know
            if it is the best guess */
+        // 获取一个同步的阈值.该阈值参考上一帧的duration,且在AV_SYNC_THRESHOLD_MIN与AV_SYNC_THRESHOLD_MAX之间.
+        //  sync_threshold > 0
         sync_threshold = FFMAX(AV_SYNC_THRESHOLD_MIN, FFMIN(AV_SYNC_THRESHOLD_MAX, delay));
         if (!isnan(diff) && fabs(diff) < is->max_frame_duration) {
+            // 如果视频时钟和主时钟的差值小于0且小于一个阈值
+            // 说明视频走得比主时钟慢diff,在计算delay时要把上一帧的duration算上.
+            // 0表示不延迟,直接播放.
             if (diff <= -sync_threshold)
                 delay = FFMAX(0, delay + diff);
-            else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD)
-                delay = delay + diff;
-            else if (diff >= sync_threshold)
-                delay = 2 * delay;
+            // 如果diff大于sync_threshold
+            // 将上一帧的显示时长和diff都算上
+            else if (diff >= sync_threshold && delay > AV_SYNC_FRAMEDUP_THRESHOLD) // 视频时钟超前于同步时钟，且超过同步域值，但上一帧播放时长超长
+                delay = delay + diff;    // 仅仅校正为delay=delay+diff，主要是AV_SYNC_FRAMEDUP_THRESHOLD参数的作用，不作同步补偿
+            else if (diff >= sync_threshold)        // 视频时钟超前于同步时钟，且超过同步域值
+                delay = 2 * delay;                  // 视频播放要放慢脚步，delay扩大至2倍
+            // 当diff在-sync_threshold和+sync_threshold之间时,delay不变化
         }
     }
 
@@ -1553,8 +1571,10 @@ static double compute_target_delay(double delay, VideoState *is)
 
 static double vp_duration(VideoState *is, Frame *vp, Frame *nextvp) {
     if (vp->serial == nextvp->serial) {
-        double duration = nextvp->pts - vp->pts;
-        if (isnan(duration) || duration <= 0 || duration > is->max_frame_duration)
+        double duration = nextvp->pts - vp->pts; 
+        if (isnan(duration) ||  // 异常duration
+            duration <= 0 ||    // vp->duration >= nextvp:通常在首帧时，vp==nextvp
+            duration > is->max_frame_duration)
             return vp->duration;
         else
             return duration;
@@ -1598,35 +1618,43 @@ retry:
             Frame *vp, *lastvp;
 
             /* dequeue the picture */
+            // 取出上一帧lastvp，和将要显示的一帧vp
             lastvp = frame_queue_peek_last(&is->pictq);
             vp = frame_queue_peek(&is->pictq);
 
+            // 将要显示的一帧和当前"解码"的一帧，序列不相同？表示当前显示的滞后了，重新获取显示帧
             if (vp->serial != is->videoq.serial) {
                 frame_queue_next(&is->pictq);
                 goto retry;
             }
 
+            // 如果上一帧和当前帧的播放序列不同，表示显示帧为新的播放序列，重置timer
             if (lastvp->serial != vp->serial)
                 is->frame_timer = av_gettime_relative() / 1000000.0;
 
+            // 正常暂停不会进入此处，如果暂停状态下跳转
             if (is->paused)
                 goto display;
 
             /* compute nominal last_duration */
-            last_duration = vp_duration(is, lastvp, vp);
-            delay = compute_target_delay(last_duration, is);
+            last_duration = vp_duration(is, lastvp, vp);            /* 获取上一帧视频显示的时长 */
+            delay = compute_target_delay(last_duration, is);        /* 计算这一帧视频要经过delay才能开始播放 */
 
-            time= av_gettime_relative()/1000000.0;
+            time = av_gettime_relative()/1000000.0;
+            // 当前帧播放时刻(is->frame_timer+delay)大于当前时刻(time)，表示播放时刻到
             if (time < is->frame_timer + delay) {
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
+                // 播放时刻未到，则不更新rindex，把上一帧再lastvp再播放一遍
                 goto display;
             }
 
             is->frame_timer += delay;
+            // 校正frame_timer值：若frame_timer落后于当前系统时间太久(超过最大同步域值)，则更新为当前系统时间
             if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
                 is->frame_timer = time;
 
             SDL_LockMutex(is->pictq.mutex);
+            // 根据视频的pts修改视频时钟
             if (!isnan(vp->pts))
                 update_video_pts(is, vp->pts, vp->pos, vp->serial);
             SDL_UnlockMutex(is->pictq.mutex);
@@ -1675,6 +1703,7 @@ retry:
                 }
             }
 
+            // 删除当前读指针元素，读指针+1。若未丢帧，读指针从lastvp更新到vp；若有丢帧，读指针从vp更新到nextvp
             frame_queue_next(&is->pictq);
             is->force_refresh = 1;
 
@@ -2345,17 +2374,20 @@ static int audio_decode_frame(VideoState *is)
     int wanted_nb_samples;
     Frame *af;
 
+    // 是否暂停状态？
     if (is->paused)
         return -1;
 
     do {
 #if defined(_WIN32)
+        // 获取队列剩余长度
         while (frame_queue_nb_remaining(&is->sampq) == 0) {
             if ((av_gettime_relative() - audio_callback_time) > 1000000LL * is->audio_hw_buf_size / is->audio_tgt.bytes_per_sec / 2)
                 return -1;
             av_usleep (1000);
         }
 #endif
+        // 取出一阵来，并且该帧就是当前的播放序列（seek后serial将产生变化）
         if (!(af = frame_queue_peek_readable(&is->sampq)))
             return -1;
         frame_queue_next(&is->sampq);
@@ -2426,6 +2458,7 @@ static int audio_decode_frame(VideoState *is)
         is->audio_buf = is->audio_buf1;
         resampled_data_size = len2 * is->audio_tgt.channels * av_get_bytes_per_sample(is->audio_tgt.fmt);
     } else {
+        // 将audio存储到is->audio_buf，当sdl回调时从is->audio_buf中拿取数据
         is->audio_buf = af->frame->data[0];
         resampled_data_size = data_size;
     }
@@ -2433,6 +2466,7 @@ static int audio_decode_frame(VideoState *is)
     audio_clock0 = is->audio_clock;
     /* update the audio clock with the pts */
     if (!isnan(af->pts))
+        // 下一帧的时间戳
         is->audio_clock = af->pts + (double) af->frame->nb_samples / af->frame->sample_rate;
     else
         is->audio_clock = NAN;
@@ -2833,6 +2867,7 @@ static int read_thread(void *arg)
     if (ic->pb)
         ic->pb->eof_reached = 0; // FIXME hack, ffplay maybe should not use avio_feof() to test for the end
 
+    // 允许通过bytes来跳转
     if (seek_by_bytes < 0)
         seek_by_bytes = !!(ic->iformat->flags & AVFMT_TS_DISCONT) && strcmp("ogg", ic->iformat->name);
 
@@ -2950,19 +2985,23 @@ static int read_thread(void *arg)
             continue;
         }
 #endif
+        // 在读线程中seek
         if (is->seek_req) {
             int64_t seek_target = is->seek_pos;
+            // seek最大值和seek最小值
             int64_t seek_min    = is->seek_rel > 0 ? seek_target - is->seek_rel + 2: INT64_MIN;
             int64_t seek_max    = is->seek_rel < 0 ? seek_target - is->seek_rel - 2: INT64_MAX;
 // FIXME the +-2 is due to rounding being not done in the correct direction in generation
 //      of the seek_pos/seek_rel variables
 
+            // avformat_seek_file 使用ts跳转
             ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, is->seek_flags);
             if (ret < 0) {
                 av_log(NULL, AV_LOG_ERROR,
                        "%s: error while seeking\n", is->ic->url);
             } else {
-                if (is->audio_stream >= 0)
+                // seek成功后放入一个flush_pkt,刷新序列号
+                if (is->audio_stream >= 0) {
                     packet_queue_flush(&is->audioq);
                 if (is->subtitle_stream >= 0)
                     packet_queue_flush(&is->subtitleq);
@@ -2977,9 +3016,11 @@ static int read_thread(void *arg)
             is->seek_req = 0;
             is->queue_attachments_req = 1;
             is->eof = 0;
+            // 暂停状态下跳转
             if (is->paused)
                 step_to_next_frame(is);
         }
+        // 投递空帧的含义？刷新解码器的缓存区
         if (is->queue_attachments_req) {
             if (is->video_st && is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC) {
                 if ((ret = av_packet_ref(pkt, &is->video_st->attached_pic)) < 0)
@@ -3006,8 +3047,10 @@ static int read_thread(void *arg)
             (!is->audio_st || (is->auddec.finished == is->audioq.serial && frame_queue_nb_remaining(&is->sampq) == 0)) &&
             (!is->video_st || (is->viddec.finished == is->videoq.serial && frame_queue_nb_remaining(&is->pictq) == 0))) {
             if (loop != 1 && (!loop || --loop)) {
+                // 跳回开始
                 stream_seek(is, start_time != AV_NOPTS_VALUE ? start_time : 0, 0, 0);
             } else if (autoexit) {
+                // 自动退出
                 ret = AVERROR_EOF;
                 goto fail;
             }
@@ -3015,6 +3058,7 @@ static int read_thread(void *arg)
         ret = av_read_frame(ic, pkt);
         if (ret < 0) {
             if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !is->eof) {
+                // 给一些空包的含义？暂停在此处，不停止
                 if (is->video_stream >= 0)
                     packet_queue_put_nullpacket(&is->videoq, pkt, is->video_stream);
                 if (is->audio_stream >= 0)
@@ -3023,6 +3067,7 @@ static int read_thread(void *arg)
                     packet_queue_put_nullpacket(&is->subtitleq, pkt, is->subtitle_stream);
                 is->eof = 1;
             }
+            // 如果是读错误，直接终止读循环
             if (ic->pb && ic->pb->error) {
                 if (autoexit)
                     goto fail;
@@ -3237,10 +3282,13 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
             SDL_ShowCursor(0);
             cursor_hidden = 1;
         }
+        // remaining_time:剩余时间，视频显示的剩余时间，大于零表示需要休眠的时长
         if (remaining_time > 0.0)
             av_usleep((int64_t)(remaining_time * 1000000.0));
-        remaining_time = REFRESH_RATE;
-        if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
+        remaining_time = REFRESH_RATE; // 进行同步判断的最小间隔
+        if (is->show_mode != SHOW_MODE_NONE && 
+            (!is->paused ||         // 不是暂停状态
+            is->force_refresh))     // 强制刷新？
             video_refresh(is, &remaining_time);
         SDL_PumpEvents();
     }
@@ -3369,6 +3417,7 @@ static void event_loop(VideoState *cur_stream)
             do_seek:
                     if (seek_by_bytes) {
                         pos = -1;
+                        // 提取队列中的buffer的上一帧的位置
                         if (pos < 0 && cur_stream->video_stream >= 0)
                             pos = frame_queue_last_pos(&cur_stream->pictq);
                         if (pos < 0 && cur_stream->audio_stream >= 0)
@@ -3376,9 +3425,14 @@ static void event_loop(VideoState *cur_stream)
                         if (pos < 0)
                             pos = avio_tell(cur_stream->ic->pb);
                         if (cur_stream->ic->bit_rate)
+                            // cur_stream->ic->bit_rate : bits/s
+                            // cur_stream->ic->bit_rate / 8.0 : bytes/s
+                            // incr :before : s
+                            //      :after : total bytes of incr s
                             incr *= cur_stream->ic->bit_rate / 8.0;
                         else
                             incr *= 180000.0;
+                        // pos 是在流中的绝对值，incr是相对值
                         pos += incr;
                         stream_seek(cur_stream, pos, incr, 1);
                     } else {
@@ -3386,6 +3440,7 @@ static void event_loop(VideoState *cur_stream)
                         if (isnan(pos))
                             pos = (double)cur_stream->seek_pos / AV_TIME_BASE;
                         pos += incr;
+                        // 与文件开始时间比较
                         if (cur_stream->ic->start_time != AV_NOPTS_VALUE && pos < cur_stream->ic->start_time / (double)AV_TIME_BASE)
                             pos = cur_stream->ic->start_time / (double)AV_TIME_BASE;
                         stream_seek(cur_stream, (int64_t)(pos * AV_TIME_BASE), (int64_t)(incr * AV_TIME_BASE), 0);
@@ -3522,12 +3577,14 @@ static int opt_sync(void *optctx, const char *opt, const char *arg)
     return 0;
 }
 
+// ss option: 将从 start_time 开始seek
 static int opt_seek(void *optctx, const char *opt, const char *arg)
 {
     start_time = parse_time_or_die(opt, arg, 1);
     return 0;
 }
 
+// t option: 持续时间
 static int opt_duration(void *optctx, const char *opt, const char *arg)
 {
     duration = parse_time_or_die(opt, arg, 1);
@@ -3544,7 +3601,8 @@ static int opt_show_mode(void *optctx, const char *opt, const char *arg)
 }
 
 static void opt_input_file(void *optctx, const char *filename)
-{
+{   
+    // 意味着进入第二次，有两个输入文件？
     if (input_filename) {
         av_log(NULL, AV_LOG_FATAL,
                "Argument '%s' provided as input filename, but '%s' was already specified.\n",
@@ -3698,8 +3756,10 @@ int main(int argc, char **argv)
     signal(SIGINT , sigterm_handler); /* Interrupt (ANSI).    */
     signal(SIGTERM, sigterm_handler); /* Termination (ANSI).  */
 
+    // 执行命令时输出的一系列编译时的选项、版本、版权等
     show_banner(argc, argv, options);
 
+    // options 是一个全局结构，预定义了支持的参数列表及含义、回调等
     parse_options(NULL, argc, argv, options, opt_input_file);
 
     if (!input_filename) {

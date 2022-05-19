@@ -192,8 +192,10 @@ struct variant {
 typedef struct HLSContext {
     AVClass *class;
     AVFormatContext *ctx;
+    // variant hls：playlist是下一个media playlist的URL
     int n_variants;
     struct variant **variants;
+    // master playlist：playlist是下分段的media的URL
     int n_playlists;
     struct playlist **playlists;
     int n_renditions;
@@ -334,6 +336,7 @@ static struct variant *new_variant(HLSContext *c, struct variant_info *info,
     struct variant *var;
     struct playlist *pls;
 
+    // 给ctx->playlist新增一个元素
     pls = new_playlist(c, url, base);
     if (!pls)
         return NULL;
@@ -348,7 +351,8 @@ static struct variant *new_variant(HLSContext *c, struct variant_info *info,
         strcpy(var->video_group, info->video);
         strcpy(var->subtitles_group, info->subtitles);
     }
-
+    
+    // 使数组和index都加一
     dynarray_add(&c->variants, &c->n_variants, var);
     dynarray_add(&var->playlists, &var->n_playlists, pls);
     return var;
@@ -709,6 +713,9 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     return ret;
 }
 
+// 对于一个由 多个 playlist文件组成的 master playlist 来说
+// 会存储多个 variant结构，同时存储多个 playlist
+// 而对于一个 media playlist 来说， playlist中只有一个item，该item会有多个segment
 static int parse_playlist(HLSContext *c, const char *url,
                           struct playlist *pls, AVIOContext *in)
 {
@@ -748,6 +755,7 @@ static int parse_playlist(HLSContext *c, const char *url,
 
     if (!in) {
         AVDictionary *opts = NULL;
+        // 访问 m3u8 时使用 HLSContext::avio_opts 中的options 
         av_dict_copy(&opts, c->avio_opts, 0);
 
         if (c->http_persistent)
@@ -785,11 +793,13 @@ static int parse_playlist(HLSContext *c, const char *url,
     }
     while (!avio_feof(in)) {
         ff_get_chomp_line(in, line, sizeof(line));
+        // 首先识别是否是variant hls
         if (av_strstart(line, "#EXT-X-STREAM-INF:", &ptr)) {
             is_variant = 1;
             memset(&variant_info, 0, sizeof(variant_info));
             ff_parse_key_value(ptr, (ff_parse_key_val_cb) handle_variant_args,
                                &variant_info);
+        // EXT-X-KET 描述加密方法及加密key的url
         } else if (av_strstart(line, "#EXT-X-KEY:", &ptr)) {
             struct key_info info = {{0}};
             ff_parse_key_value(ptr, (ff_parse_key_val_cb) handle_key_args,
@@ -888,7 +898,9 @@ static int parse_playlist(HLSContext *c, const char *url,
             av_log(c->ctx, AV_LOG_INFO, "Skip ('%s')\n", line);
             continue;
         } else if (line[0]) {
+            // 在同一个文件中 variant 和 segment 可以同时存在？？
             if (is_variant) {
+                // 如果使variant的hls，将 list存在 ctx->variant 中
                 if (!new_variant(c, &variant_info, line, url)) {
                     ret = AVERROR(ENOMEM);
                     goto fail;
@@ -897,6 +909,8 @@ static int parse_playlist(HLSContext *c, const char *url,
             }
             if (is_segment) {
                 struct segment *seg;
+                
+                // 如果pls是有效的，不会增加playlist中的容量，该pls也不会切换
                 ret = ensure_playlist(c, &pls, url);
                 if (ret < 0)
                     goto fail;
@@ -953,6 +967,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                 }
                 seg->duration = duration;
                 seg->key_type = key_type;
+                // 分段存储在每个pls的segment中，对一个只有分段文件的hls来说，只有一个 pls
                 dynarray_add(&pls->segments, &pls->n_segments, seg);
                 is_segment = 0;
 
@@ -1251,12 +1266,20 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
            seg->url, seg->url_offset, pls->index);
 
     if (seg->key_type == KEY_NONE) {
+		// 直接打开 segment 的 url
+        // 使用 HLSContext::avio_opts 中的options 
         ret = open_url(pls->parent, in, seg->url, &c->avio_opts, opts, &is_http);
     } else if (seg->key_type == KEY_AES_128) {
+        // 先打开 分段的 密钥url 再打开分段的 url
         char iv[33], key[33], url[MAX_URL_SIZE];
         if (strcmp(seg->key, pls->key_url)) {
             AVIOContext *pb = NULL;
+            // 代开key字段的url，获取密钥
+            // 此处代表获取密钥
+            // 使用 HLSContext::avio_opts 中的options 
+            // 对于使用?等连接符连接的url如何传递到key uri中
             if (open_url(pls->parent, &pb, seg->key, &c->avio_opts, opts, NULL) == 0) {
+                // 读取密钥？到pls->key
                 ret = avio_read(pb, pls->key, sizeof(pls->key));
                 if (ret != sizeof(pls->key)) {
                     av_log(pls->parent, AV_LOG_ERROR, "Unable to read key file %s\n",
@@ -1280,6 +1303,8 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
         av_dict_set(&opts, "key", key, 0);
         av_dict_set(&opts, "iv", iv, 0);
 
+        // 打开segment代表的分段的url
+        // 使用 HLSContext::avio_opts 中的options 
         ret = open_url(pls->parent, in, url, &c->avio_opts, opts, &is_http);
         if (ret < 0) {
             goto cleanup;
@@ -1541,6 +1566,7 @@ reload:
         }
     }
 
+    // 分段存在 pls->segments 中
     seg = next_segment(v);
     if (c->http_multiple == 1 && !v->input_next_requested &&
         seg && seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL)) {
@@ -1719,6 +1745,9 @@ static int save_avio_options(AVFormatContext *s)
     int ret = 0;
 
     while (*opt) {
+        // 从s->pb中获取启动时设置的options，支持的options见 opts 数组
+        // 设置到 HLSContext::avio_opts 中
+        // 是从 AVFromatContext::pb 中获取而不是 AVFromatContext
         if (av_opt_get(s->pb, *opt, AV_OPT_SEARCH_CHILDREN | AV_OPT_ALLOW_NULL, &buf) >= 0) {
             ret = av_dict_set(&c->avio_opts, *opt, buf,
                               AV_DICT_DONT_STRDUP_VAL);
@@ -1881,6 +1910,10 @@ static int hls_read_header(AVFormatContext *s)
        the range header */
     av_dict_set_int(&c->avio_opts, "seekable", c->http_seekable, 0);
 
+    // 两次解析playlist的过程
+    // 第一次解析 访问m3u8 url 获取并解析 m3u8 索引的内容，形成playlist结构
+    // 第一次解析时，传入 AVIOContext : s->pb
+    // 这个可以在avformat_open_input时 通过avio_alloc_context初始化一个read callback(但是 io_open事件怎么处理)
     if ((ret = parse_playlist(c, s->url, NULL, s->pb)) < 0)
         return ret;
 
@@ -1890,13 +1923,19 @@ static int hls_read_header(AVFormatContext *s)
     }
     /* If the playlist only contained playlists (Master Playlist),
      * parse each individual playlist. */
+    // media playlist n_playlists == 1
+    // n_segments为0 表示没有分段 
+    // 含义是判断 是否为 master playlist
     if (c->n_playlists > 1 || c->playlists[0]->n_segments == 0) {
         for (i = 0; i < c->n_playlists; i++) {
             struct playlist *pls = c->playlists[i];
             pls->m3u8_hold_counters = 0;
+            // 第二次解析时，不传入AVIOContext
+            // 访问 master playlist 的每个 variant item 不传递aviocontext，无法控制其输入方式
             if ((ret = parse_playlist(c, pls->url, pls, NULL)) < 0) {
                 av_log(s, AV_LOG_WARNING, "parse_playlist error %s [%s]\n", av_err2str(ret), pls->url);
                 pls->broken = 1;
+                // 只有一个直接出错
                 if (c->n_playlists > 1)
                     continue;
                 return ret;
@@ -1913,6 +1952,7 @@ static int hls_read_header(AVFormatContext *s)
 
     /* If this isn't a live stream, calculate the total duration of the
      * stream. */
+    // 有 EXT-X-ENDLIST 字段 被认为是 vod
     if (c->variants[0]->playlists[0]->finished) {
         int64_t duration = 0;
         for (i = 0; i < c->variants[0]->playlists[0]->n_segments; i++)
@@ -1989,6 +2029,7 @@ static int hls_read_header(AVFormatContext *s)
             pls->ctx = NULL;
             return AVERROR(ENOMEM);
         }
+		// TODO 此pb 又是用作何用？ts读取,并添加ts读取的回调
         ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
                           read_data, NULL, NULL);
         pls->ctx->probesize = s->probesize > 0 ? s->probesize : 1024 * 4;
@@ -2009,6 +2050,7 @@ static int hls_read_header(AVFormatContext *s)
         }
         av_free(url);
         pls->ctx->pb       = &pls->pb;
+        // 打开url，映射到pb的方法 默认位 io_open_default
         pls->ctx->io_open  = nested_io_open;
         pls->ctx->flags   |= s->flags & ~AVFMT_FLAG_CUSTOM_IO;
 
@@ -2017,6 +2059,8 @@ static int hls_read_header(AVFormatContext *s)
 
         av_dict_copy(&seg_format_opts, c->seg_format_opts, 0);
 
+        // 打开的是 http:// 的分段文件的 avformat
+        // 打开一个 ts
         ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, &seg_format_opts);
         av_dict_free(&seg_format_opts);
         if (ret < 0)
